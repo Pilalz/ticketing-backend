@@ -1,182 +1,329 @@
 const express = require('express');
 const router = express.Router();
 const pool = require('../config/database');
-const { authenticateToken, authorizeRole } = require('../middleware/auth');
 
-// Get all tickets (accessible by both secretary and director)
-router.get('/', authenticateToken, async (req, res) => {
+// Get all meeting schedules (for Monitor)
+router.get('/', async (req, res) => {
   try {
-    const { status, date } = req.query;
+    const today = new Date().toLocaleDateString('fr-CA');
+
+    const allowedStatuses = ['Waiting', 'In The Room'];
+
     let query = `
-      SELECT t.*, u.full_name as created_by_name 
-      FROM tickets t
-      LEFT JOIN users u ON t.created_by = u.id
-      WHERE 1=1
+      SELECT 
+        ms.rowid,
+        ms.date,
+        ms.time,
+        ms.subject,
+        ms.status,
+        ms.response,
+        json_agg(
+          json_build_object(
+            'rowid', mp.rowid,
+            'person_rowid', mp.person_rowid,
+            'name', mp.name
+          )
+        ) FILTER (WHERE mp.rowid IS NOT NULL) as participants
+      FROM "meetingSchedule" ms
+      LEFT JOIN "meetingParticipants" mp ON ms.rowid = mp."meetingSchedule_rowid"
+      WHERE 
+        ms.date = $1 
+        AND ms.status = ANY($2)
     `;
-    const params = [];
 
-    if (status) {
-      params.push(status);
-      query += ` AND t.status = $${params.length}`;
-    }
+    const params = [today, allowedStatuses];
 
-    if (date) {
-      params.push(date);
-      query += ` AND DATE(t.appointment_time) = $${params.length}`;
-    }
-
-    query += ' ORDER BY t.appointment_time ASC';
+    query += `
+      GROUP BY ms.rowid, ms.date, ms.time, ms.subject, ms.status, ms.response
+      ORDER BY ms.time ASC
+    `;
 
     const result = await pool.query(query, params);
-    res.json(result.rows);
+
+    res.json({
+      success: true,
+      data: result.rows,
+      count: result.rows.length
+    });
+
   } catch (error) {
-    console.error('Get tickets error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get meeting schedules error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error', 
+      error: error.message 
+    });
   }
 });
 
-// Get single ticket
-router.get('/:id', authenticateToken, async (req, res) => {
+// GET ALL TICKETS (UNTUK ADMIN) - Tanpa Filter Tanggal
+router.get('/all', async (req, res) => {
   try {
-    const { id } = req.params;
-    const result = await pool.query(
-      `SELECT t.*, u.full_name as created_by_name 
-       FROM tickets t
-       LEFT JOIN users u ON t.created_by = u.id
-       WHERE t.id = $1`,
-      [id]
-    );
+    const query = `
+      SELECT 
+        ms.rowid,
+        ms.date,
+        ms.time,
+        ms.subject,
+        ms.status,
+        ms.response,
+        json_agg(
+          json_build_object(
+            'name', mp.name
+          )
+        ) FILTER (WHERE mp.rowid IS NOT NULL) as participants
+      FROM "meetingSchedule" ms
+      LEFT JOIN "meetingParticipants" mp ON ms.rowid = mp."meetingSchedule_rowid"
+      GROUP BY ms.rowid
+      ORDER BY ms.date DESC, ms.time DESC
+    `;
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Ticket not found' });
-    }
+    const result = await pool.query(query);
 
-    res.json(result.rows[0]);
+    res.json({
+      success: true,
+      data: result.rows,
+      count: result.rows.length
+    });
   } catch (error) {
-    console.error('Get ticket error:', error);
-    res.status(500).json({ message: 'Server error' });
+    console.error('Get all tickets error:', error);
+    res.status(500).json({ success: false, message: 'Server error' });
   }
 });
 
-// Create ticket (only secretary)
-router.post('/', authenticateToken, authorizeRole('secretary'), async (req, res) => {
+// TAMBAH TICKET BARU (POST)
+router.post('/', async (req, res) => {
+  const client = await pool.connect(); // Ambil 1 koneksi khusus
+  
   try {
-    const { guest_name, company, phone, email, purpose, appointment_time } = req.body;
+    const { date, time, subject, participants } = req.body;
 
-    // Validate required fields
-    if (!guest_name || !purpose || !appointment_time) {
-      return res.status(400).json({ message: 'Guest name, purpose, and appointment time are required' });
+    await client.query('BEGIN');
+
+    const scheduleQuery = `
+      INSERT INTO "meetingSchedule" (date, time, subject, status, response)
+      VALUES ($1, $2, $3, 'Waiting', '')
+      RETURNING rowid
+    `;
+    const scheduleResult = await client.query(scheduleQuery, [date, time, subject]);
+    const meetingId = scheduleResult.rows[0].rowid;
+
+    // 3. Insert ke Tabel Peserta (Children) - Jika ada pesertanya
+    if (participants && participants.length > 0) {
+      const participantQuery = `
+        INSERT INTO "meetingParticipants" ("meetingSchedule_rowid", name, person_rowid)
+        VALUES ($1, $2, $3)
+      `;
+      
+      for (const name of participants) {
+        // person_rowid kita isi null atau random string dulu jika tidak ada tabel master person
+        await client.query(participantQuery, [meetingId, name, null]); 
+      }
     }
 
-    const result = await pool.query(
-      `INSERT INTO tickets (guest_name, company, phone, email, purpose, appointment_time, created_by, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'waiting')
-       RETURNING *`,
-      [guest_name, company, phone, email, purpose, appointment_time, req.user.id]
-    );
+    // 4. Commit (Simpan Permanen)
+    await client.query('COMMIT');
 
-    res.status(201).json(result.rows[0]);
+    res.json({
+      success: true,
+      message: 'Ticket created successfully',
+      data: { rowid: meetingId }
+    });
+
   } catch (error) {
+    // 5. Rollback (Batalkan semua jika ada error)
+    await client.query('ROLLBACK');
     console.error('Create ticket error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to create ticket', 
+      error: error.message 
+    });
+  } finally {
+    // 6. Lepaskan koneksi kembali ke pool
+    client.release();
   }
 });
 
-// Update ticket (only secretary)
-router.put('/:id', authenticateToken, authorizeRole('secretary'), async (req, res) => {
+// EDIT TICKET (PUT)
+router.put('/:id', async (req, res) => {
+  const client = await pool.connect();
+  
   try {
     const { id } = req.params;
-    const { guest_name, company, phone, email, purpose, appointment_time, status } = req.body;
+    const { date, time, subject, participants } = req.body;
 
-    const result = await pool.query(
-      `UPDATE tickets 
-       SET guest_name = $1, company = $2, phone = $3, email = $4, 
-           purpose = $5, appointment_time = $6, status = $7, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $8
-       RETURNING *`,
-      [guest_name, company, phone, email, purpose, appointment_time, status, id]
-    );
+    await client.query('BEGIN'); // Mulai Transaksi
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Ticket not found' });
+    // 1. Update Tabel Utama (Schedule)
+    const updateQuery = `
+      UPDATE "meetingSchedule"
+      SET date = $1, time = $2, subject = $3
+      WHERE rowid = $4
+    `;
+    await client.query(updateQuery, [date, time, subject, id]);
+
+    // 2. Hapus SEMUA peserta lama untuk meeting ini
+    const deleteParticipantsQuery = `
+      DELETE FROM "meetingParticipants"
+      WHERE "meetingSchedule_rowid" = $1
+    `;
+    await client.query(deleteParticipantsQuery, [id]);
+
+    // 3. Masukkan ulang peserta baru (jika ada)
+    if (participants && participants.length > 0) {
+      const insertParticipantQuery = `
+        INSERT INTO "meetingParticipants" ("meetingSchedule_rowid", name)
+        VALUES ($1, $2)
+      `;
+      
+      for (const name of participants) {
+        await client.query(insertParticipantQuery, [id, name]);
+      }
     }
 
-    res.json(result.rows[0]);
+    await client.query('COMMIT'); // Simpan permanen
+
+    res.json({
+      success: true,
+      message: 'Ticket updated successfully'
+    });
+
   } catch (error) {
+    await client.query('ROLLBACK'); // Batalkan jika error
     console.error('Update ticket error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update ticket', 
+      error: error.message 
+    });
+  } finally {
+    client.release();
   }
 });
 
-// Update ticket status (secretary can update to any status)
-router.patch('/:id/status', authenticateToken, authorizeRole('secretary', 'director'), async (req, res) => {
+// Get single meeting schedule by ID
+router.get('/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    const query = `
+      SELECT 
+        ms.rowid,
+        ms.date,
+        ms.time,
+        ms.subject,
+        ms.status,
+        ms.response,
+        json_agg(
+          json_build_object(
+            'rowid', mp.rowid,
+            'person_rowid', mp.person_rowid,
+            'name', mp.name
+          )
+        ) FILTER (WHERE mp.rowid IS NOT NULL) as participants
+      FROM "meetingSchedule" ms
+      LEFT JOIN "meetingParticipants" mp ON ms.rowid = mp."meetingSchedule_rowid"
+      WHERE ms.rowid = $1
+      GROUP BY ms.rowid, ms.date, ms.time, ms.subject, ms.status, ms.response
+    `;
+    
+    const result = await pool.query(query, [id]);
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ 
+        success: false,
+        message: 'Meeting schedule not found' 
+      });
+    }
+
+    res.json({
+      success: true,
+      data: result.rows[0]
+    });
+  } catch (error) {
+    console.error('Get meeting schedule error:', error);
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error',
+      error: error.message
+    });
+  }
+});
+
+// Update status
+router.patch('/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
 
-    if (!status || !['waiting', 'in_room', 'completed', 'cancelled', 'rejected'].includes(status)) {
-      return res.status(400).json({ message: 'Invalid status' });
+    const validStatuses = ['Waiting', 'In The Room', 'Finished', 'Overdue', 'Reject'];
+    
+    if (!status || !validStatuses.includes(status)) {
+      return res.status(400).json({ 
+        success: false,
+        message: `Invalid status. Must be one of: ${validStatuses.join(', ')}` 
+      });
     }
 
     const result = await pool.query(
-      `UPDATE tickets 
-       SET status = $1, updated_at = CURRENT_TIMESTAMP
-       WHERE id = $2
+      `UPDATE "meetingSchedule" 
+       SET status = $1
+       WHERE rowid = $2
        RETURNING *`,
       [status, id]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Ticket not found' });
+      return res.status(404).json({ 
+        success: false,
+        message: 'Meeting schedule not found' 
+      });
     }
 
-    res.json(result.rows[0]);
+    res.json({
+      success: true,
+      message: 'Status updated successfully',
+      data: result.rows[0]
+    });
   } catch (error) {
     console.error('Update status error:', error);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
-
-// Delete ticket (only secretary)
-router.delete('/:id', authenticateToken, authorizeRole('secretary'), async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    const result = await pool.query(
-      'DELETE FROM tickets WHERE id = $1 RETURNING *',
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Ticket not found' });
-    }
-
-    res.json({ message: 'Ticket deleted successfully' });
-  } catch (error) {
-    console.error('Delete ticket error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error',
+      error: error.message
+    });
   }
 });
 
 // Get dashboard statistics
-router.get('/stats/dashboard', authenticateToken, async (req, res) => {
+router.get('/stats/dashboard', async (req, res) => {
   try {
     const today = new Date().toISOString().split('T')[0];
 
     const statsResult = await pool.query(
       `SELECT 
-        COUNT(*) FILTER (WHERE status = 'waiting' AND DATE(appointment_time) = $1) as waiting,
-        COUNT(*) FILTER (WHERE status = 'in_room' AND DATE(appointment_time) = $1) as in_room,
-        COUNT(*) FILTER (WHERE status = 'completed' AND DATE(appointment_time) = $1) as completed,
-        COUNT(*) FILTER (WHERE DATE(appointment_time) = $1) as total_today
-       FROM tickets`,
+        COUNT(*) FILTER (WHERE status = 'scheduled' AND date = $1) as scheduled,
+        COUNT(*) FILTER (WHERE status = 'in_progress' AND date = $1) as in_progress,
+        COUNT(*) FILTER (WHERE status = 'completed' AND date = $1) as completed,
+        COUNT(*) FILTER (WHERE status = 'cancelled' AND date = $1) as cancelled,
+        COUNT(*) FILTER (WHERE date = $1) as total_today,
+        COUNT(*) as total_all
+       FROM "meetingSchedule"`,
       [today]
     );
 
-    res.json(statsResult.rows[0]);
+    res.json({
+      success: true,
+      data: statsResult.rows[0]
+    });
   } catch (error) {
     console.error('Get stats error:', error);
-    res.status(500).json({ message: 'Server error' });
+    res.status(500).json({ 
+      success: false,
+      message: 'Server error',
+      error: error.message
+    });
   }
 });
 
