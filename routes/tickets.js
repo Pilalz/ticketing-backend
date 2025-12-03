@@ -27,7 +27,7 @@ router.get('/', async (req, res) => {
       FROM "meetingSchedule" ms
       LEFT JOIN "meetingParticipants" mp ON ms.rowid = mp."meetingSchedule_rowid"
       WHERE 
-        ms.date = $1 
+        ms.date >= $1 
         AND ms.status = ANY($2)
     `;
 
@@ -35,7 +35,7 @@ router.get('/', async (req, res) => {
 
     query += `
       GROUP BY ms.rowid, ms.date, ms.time, ms.subject, ms.status, ms.response
-      ORDER BY ms.time ASC
+      ORDER BY ms.date ASC
     `;
 
     const result = await pool.query(query, params);
