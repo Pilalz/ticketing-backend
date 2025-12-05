@@ -5,8 +5,6 @@ const pool = require('../config/database');
 // Get all meeting schedules (for Monitor)
 router.get('/', async (req, res) => {
   try {
-    const today = new Date().toLocaleDateString('fr-CA');
-
     const allowedStatuses = ['Waiting', 'In The Room'];
 
     let query = `
@@ -27,15 +25,14 @@ router.get('/', async (req, res) => {
       FROM "meetingSchedule" ms
       LEFT JOIN "meetingParticipants" mp ON ms.rowid = mp."meetingSchedule_rowid"
       WHERE 
-        ms.date >= $1 
-        AND ms.status = ANY($2)
+        ms.status = ANY($1)
     `;
 
-    const params = [today, allowedStatuses];
+    const params = [allowedStatuses];
 
     query += `
-      GROUP BY ms.rowid, ms.date, ms.time, ms.subject, ms.status, ms.response
-      ORDER BY ms.date ASC
+      GROUP BY ms.rowid
+      ORDER BY ms.time ASC
     `;
 
     const result = await pool.query(query, params);
@@ -75,7 +72,7 @@ router.get('/all', async (req, res) => {
       FROM "meetingSchedule" ms
       LEFT JOIN "meetingParticipants" mp ON ms.rowid = mp."meetingSchedule_rowid"
       GROUP BY ms.rowid
-      ORDER BY ms.date DESC, ms.time DESC
+      ORDER BY ms.date DESC, ms.time ASC
     `;
 
     const result = await pool.query(query);
